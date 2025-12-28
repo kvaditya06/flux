@@ -1,80 +1,131 @@
+require('dotenv').config(); // Load secrets from .env
+
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { Kafka } = require('kafkajs');
 
-// CONFIGURATION
-const PORT = 8080;
-const API_KEY = "AIzaSyD9Uv7lvdU79Tg6T_sNU1McKU96n6Bzp8g"; // <--- PASTE KEY HERE
+// --- 1. CONFIGURATION CHECKS ---
+if (!process.env.GOOGLE_API_KEY || !process.env.CONFLUENT_BROKER) {
+  console.error("❌ FATAL: Missing API Keys in .env file.");
+  process.exit(1);
+}
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(API_KEY);
+const TOPIC = process.env.CONFLUENT_TOPIC || "flux_events";
+const PORT = process.env.PORT || 8080;
+
+// --- 2. SETUP AI ---
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+// Use the model name that worked for you (gemini-flash-latest or gemini-pro)
 const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-const visionModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" }); // Vision capable
 
+// --- 3. SETUP KAFKA ---
+const kafka = new Kafka({
+  clientId: 'flux-backend',
+  brokers: [process.env.CONFLUENT_BROKER],
+  ssl: true,
+  sasl: {
+    mechanism: 'plain',
+    username: process.env.CONFLUENT_KEY,
+    password: process.env.CONFLUENT_SECRET,
+  },
+});
+
+const producer = kafka.producer();
+const consumer = kafka.consumer({ groupId: 'flux-brain-group' });
+
+// --- 4. START SERVER ---
 const app = express();
-const server = app.listen(PORT, () => console.log(`🧠 Real AI Brain listening on ${PORT}`));
+const server = app.listen(PORT, () => 
+  console.log(`🧠 Flux (Confluent Edition) listening on port ${PORT}`)
+);
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws) => {
-  console.log('📱 Mobile Connected');
+// Map connections to reply to the correct phone
+const connections = new Map();
 
-  ws.on('message', async (message) => {
-    const event = JSON.parse(message);
-    console.log('⚡ Processing Event:', event.type);
+async function start() {
+  console.log("🔌 Connecting to Confluent Cloud...");
+  try {
+    await producer.connect();
+    await consumer.connect();
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: false });
+    console.log("✅ Connected to Confluent Stream.");
+  } catch (err) {
+    console.error("❌ Kafka Connection Failed:", err);
+    process.exit(1);
+  }
 
-    try {
-      let aiResponse = { title: "Flux AI", text: "Processing..." };
+  // --- PART A: THE PRODUCER (Phone -> Kafka) ---
+  wss.on('connection', (ws) => {
+    const id = Date.now().toString();
+    connections.set(id, ws);
+    console.log(`📱 Phone Connected: ${id}`);
 
-      // SCENARIO 1: COMPARISON TRAP (Text)
-      if (event.type === 'INTENT_COMPARE') {
-        const prompt = `User is shopping for "Sony Alpha A7 III" and just copied the text "${event.text}" to check prices elsewhere. 
-        You represent the current store. 
-        Write a short, punchy (max 15 words) "Price Match Guarantee" notification to stop them from leaving. 
-        Be confident. Mention a specific dollar amount saved (e.g. $15).`;
-        
-        const result = await model.generateContent(prompt);
-        aiResponse = { title: "Price Match Alert", text: result.response.text() };
+    ws.on('message', async (message) => {
+      try {
+        const event = JSON.parse(message);
+        console.log(`➡️  PRODUCING to Kafka: ${event.type}`);
+
+        // Send to Confluent
+        await producer.send({
+          topic: TOPIC,
+          messages: [{ value: JSON.stringify({ ...event, connectionId: id }) }],
+        });
+      } catch (e) {
+        console.error("Error processing message:", e);
       }
+    });
 
-      // SCENARIO 2: RAGE CLICK (Frustration)
-      else if (event.type === 'INTENT_RAGE') {
-        const prompt = `User is angrily tapping the screen. They are frustrated.
-        Write a short, empathetic (max 12 words) apology offering to "Auto-Add to Cart" for them.`;
-        
-        const result = await model.generateContent(prompt);
-        aiResponse = { title: "Trouble Tapping?", text: result.response.text() };
-      }
-
-      // SCENARIO 3: VISUAL FIT CHECK (Image Analysis)
-      else if (event.type === 'UPLOAD_PHOTO') {
-        console.log("Processing Image...");
-        // Convert base64 to Google's format
-        const imagePart = {
-          inlineData: {
-            data: event.image,
-            mimeType: "image/jpeg",
-          },
-        };
-        
-        const prompt = `Analyze this room's interior design style (e.g. Minimalist, Industrial, Boho). 
-        Then, explain in 1 sentence why a "Charcoal Grey Sony Camera" fits this aesthetic perfectly.`;
-        
-        const result = await visionModel.generateContent([prompt, imagePart]);
-        aiResponse = { title: "Visual Fit Check", text: result.response.text() };
-      }
-
-      // SCENARIO 4: GHOST SWITCH (Competitor Check)
-      else if (event.type === 'INTENT_GHOST') {
-         // Keep this one fast/hardcoded or use AI if you want
-         aiResponse = { title: "Welcome Back!", text: "We verified our prices while you were gone. You're still getting the best deal." };
-      }
-
-      // Send the Real AI response back
-      ws.send(JSON.stringify({ type: 'AI_RESPONSE', ...aiResponse }));
-
-    } catch (error) {
-      console.error("AI Error:", error);
-      ws.send(JSON.stringify({ type: 'AI_RESPONSE', title: "Error", text: "AI Brain Overload." }));
-    }
+    ws.on('close', () => connections.delete(id));
   });
-});
+
+  // --- PART B: THE CONSUMER (Kafka -> AI -> Phone) ---
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      const event = JSON.parse(message.value.toString());
+      console.log(`⬅️  CONSUMING from Kafka: ${event.type}`);
+
+      // Generate AI Response
+      const response = await generateAIResponse(event);
+
+      // Send back to the specific phone
+      const clientWs = connections.get(event.connectionId);
+      if (clientWs && clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({ type: 'AI_RESPONSE', ...response }));
+      }
+    },
+  });
+}
+
+// AI LOGIC
+async function generateAIResponse(event) {
+  try {
+    let prompt = "";
+    
+    if (event.type === 'INTENT_RAGE') {
+      prompt = `User is angrily tapping. Write a 10-word apology offering help.`;
+    } else if (event.type === 'INTENT_COMPARE') {
+      prompt = `User copied "${event.text}" to check prices. Write a 10-word Price Match alert.`;
+    } else if (event.type === 'UPLOAD_PHOTO') {
+       // Visual processing simulation for the stream
+       return { title: "Visual Fit", text: "Analyzing stream... The camera matches your room's aesthetic perfectly!" };
+    } else {
+       // Just a heartbeat or init message
+       return { title: "Flux AI", text: "Event processed via Kafka." };
+    }
+
+    if (prompt) {
+      const result = await model.generateContent(prompt);
+      return { title: "Flux Intelligence", text: result.response.text() };
+    }
+    
+    return { title: "Flux", text: "..." };
+
+  } catch (e) {
+    console.error("AI Error:", e.message);
+    return { title: "Error", text: "AI Overload." };
+  }
+}
+
+start().catch(console.error);
